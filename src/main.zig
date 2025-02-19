@@ -3,20 +3,20 @@ const c = @cImport({
     @cInclude("sys/ioctl.h");
 });
 
+var screensize: [2]u16 = undefined; // 0 is x, 1 is y
+
 const gamefield = struct {
     fields: [2][400][80]u8 = undefined,
 
     tick: u1 = 0,
-    screenx: u16 = 0,
-    screeny: u16 = 0,
     x: u16 = 0,
     y: u16 = 0,
 
     fn gameTick(self: *gamefield) void {
         self.x = 0;
-        while (self.x < self.screenx) : (self.x += 1) {
+        while (self.x < screensize[0]) : (self.x += 1) {
             self.y = 0;
-            while (self.y < self.screeny) : (self.y += 1) {
+            while (self.y < screensize[1]) : (self.y += 1) {
                 self.reaper();
             }
         }
@@ -33,12 +33,12 @@ const gamefield = struct {
         var aliveCount: u8 = 0;
 
         while (xadd < 3) : (xadd += 1) {
-            xfull = @abs(@mod(self.x + xadd, self.screenx));
+            xfull = @abs(@mod(self.x + xadd, screensize[0]));
             yadd = 0;
 
             while (yadd < 3) : (yadd += 1) {
                 if ((yadd != 1) or (xadd != 1)) {
-                    yfull = @abs(@mod(self.y + yadd, self.screeny));
+                    yfull = @abs(@mod(self.y + yadd, screensize[1]));
                     ybyte = @intCast(@divFloor(yfull, 8));
                     ybit = @intCast(@mod(yfull, 8));
                     ybit = 7 - ybit;
@@ -49,8 +49,8 @@ const gamefield = struct {
                 }
             }
         }
-        xfull = @mod(self.x + 1, self.screenx);
-        yfull = @mod(self.y + 1, self.screeny);
+        xfull = @mod(self.x + 1, screensize[0]);
+        yfull = @mod(self.y + 1, screensize[1]);
         ybit = @intCast(@mod(yfull, 8));
         ybyte = @intCast(@divFloor(yfull, 8));
         ybit = 7 - ybit;
@@ -77,10 +77,10 @@ const gamefield = struct {
         var ybit: u3 = 0;
         var ybyte: u8 = 0;
 
-        while (self.x < self.screenx) : (self.x += 1) {
+        while (self.x < screensize[0]) : (self.x += 1) {
             self.y = 0;
 
-            while (self.y < self.screeny) : (self.y += 1) {
+            while (self.y < screensize[1]) : (self.y += 1) {
                 ybit = @intCast(@mod(self.y, 8));
                 ybit = 7 - ybit;
                 ybyte = @intCast(@divFloor(self.y, 8));
@@ -110,7 +110,14 @@ pub fn close(_: c_int) callconv(.C) void {
     std.os.linux.exit(0);
 }
 
-pub fn argHandler(colorNumber: *[2]u8) !void {
+pub fn resize(_: c_int) callconv(.C) void {
+    var w: c.winsize = undefined;
+    _ = c.ioctl(0, c.TIOCGWINSZ, &w);
+    screensize[0] = @min(w.ws_row, 400);
+    screensize[1] = @min(w.ws_col, 80 * 8);
+}
+
+pub fn argHandler() !u8 {
     if (1 < std.os.argv.len) {
         const stdout = std.io.getStdOut().writer();
 
@@ -149,21 +156,22 @@ pub fn argHandler(colorNumber: *[2]u8) !void {
 
         for (0..8) |x| {
             if (std.mem.eql(u8, val[0..3], argColor[x])) {
-                colorNumber.*[0] = '3';
-                colorNumber.*[1] = ansiColor[x];
-                return;
+                return ansiColor[x];
             }
         }
+        try stdout.print("Bad Color", .{});
+        std.os.linux.exit(0);
     }
+    return 0;
 }
 
 pub fn main() !void {
     const stdout = std.io.getStdOut().writer();
     const prng = std.crypto.random;
 
-    var colorNumber: [2]u8 = [2]u8{ '0', '0' }; // 92 is "/"
+    var colorNumber: [2]u8 = [2]u8{ '3', '0' }; // 92 is "/"
 
-    try argHandler(&colorNumber);
+    colorNumber[1] = try argHandler();
 
     //ansi escape codes
     const esc = "\x1B";
@@ -181,9 +189,6 @@ pub fn main() !void {
 
     try stdout.print("{s}", .{term_on});
 
-    var w: c.winsize = undefined;
-    _ = c.ioctl(0, c.TIOCGWINSZ, &w);
-
     const sa: std.os.linux.Sigaction = .{
         .handler = .{ .handler = close },
         .mask = std.os.linux.empty_sigset,
@@ -191,14 +196,21 @@ pub fn main() !void {
     };
     _ = std.os.linux.sigaction(std.os.linux.SIG.INT, &sa, null);
 
-    var game = gamefield{};
+    const termresize: std.os.linux.Sigaction = .{
+        .handler = .{ .handler = resize },
+        .mask = std.os.linux.empty_sigset,
+        .flags = 0,
+    };
 
-    game.screeny = @min(w.ws_col, 80 * 8);
-    game.screenx = @min(w.ws_row, 400);
+    _ = std.os.linux.sigaction(std.os.linux.SIG.WINCH, &termresize, null);
+
+    resize(0);
+
+    var game = gamefield{};
 
     for (game.fields[0], 0..) |_, x| {
         for (game.fields[0][x], 0..) |_, y| {
-            if (x < game.screenx and y < @divFloor(game.screeny, 8)) {
+            if (x < screensize[0] and y < @divFloor(screensize[1], 8)) {
                 game.fields[0][x][y] = prng.int(u8);
             } else {
                 game.fields[0][x][y] = 0;
@@ -212,9 +224,6 @@ pub fn main() !void {
     }
 
     while (true) {
-        _ = c.ioctl(0, c.TIOCGWINSZ, &w);
-        game.screeny = @min(w.ws_col, 80 * 8);
-        game.screenx = @min(w.ws_row, 400);
         game.gameTick();
         try game.display();
         std.time.sleep(100 * 1000 * 1000);
